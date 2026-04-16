@@ -1,0 +1,131 @@
+---
+# cisco_snmp_trap.yml — Configure SNMPv2c Traps on Cisco IOS
+#
+# Configures the following on all hosts in the "cisco" inventory group:
+#   - SNMPv2c community string (claudeaccess, RW)
+#   - Trap destination pointing to the LogicMonitor collector
+#   - Trap source interface: Tunnel1
+#   - Trap types: linkup/linkdown, BGP neighbor state changes, config changes
+#
+# Required credentials attached to this job template:
+#   - net_cred  (Machine credential — SSH username/password or SSH key)
+#
+# Variables:
+#   logicmonitor_ip  — IP address of the LogicMonitor collector (required)
+#                      Set via extra vars, host/group vars, or AAP survey.
+#                      Example: -e "logicmonitor_ip=192.168.1.50"
+#
+# Usage from AAP: launch the job template with logicmonitor_ip as a survey
+# or extra variable. Do NOT hardcode the collector IP in this file.
+
+- name: Configure SNMPv2c Traps on Cisco IOS
+  hosts: cisco
+  gather_facts: false
+  connection: network_cli
+
+  vars:
+    ansible_network_os: cisco.ios.ios
+    snmp_community: "claudeaccess"
+    snmp_trap_source: "Tunnel1"
+
+  pre_tasks:
+    - name: Verify logicmonitor_ip variable is defined
+      ansible.builtin.assert:
+        that:
+          - logicmonitor_ip is defined
+          - logicmonitor_ip | length > 0
+        fail_msg: >-
+          'logicmonitor_ip' is required but was not provided.
+          Pass it as an extra variable: -e "logicmonitor_ip=<collector_ip>"
+
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # Step 1 — Apply SNMP community string
+    # -----------------------------------------------------------------------
+    - name: Configure SNMPv2c community string ({{ snmp_community }} RW)
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server community {{ snmp_community }} RW"
+
+    # -----------------------------------------------------------------------
+    # Step 2 — Configure trap destination and source interface
+    # -----------------------------------------------------------------------
+    - name: Configure SNMP trap destination (LogicMonitor collector)
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server host {{ logicmonitor_ip }} version 2c {{ snmp_community }}"
+
+    - name: Set SNMP trap source interface to {{ snmp_trap_source }}
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server trap-source {{ snmp_trap_source }}"
+
+    # -----------------------------------------------------------------------
+    # Step 3 — Enable trap types
+    # -----------------------------------------------------------------------
+    - name: Enable interface link up/down traps
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server enable traps snmp linkup linkdown"
+
+    - name: Enable BGP neighbor state change traps
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server enable traps bgp"
+
+    - name: Enable configuration change traps
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server enable traps config"
+
+    # -----------------------------------------------------------------------
+    # Step 4 — Save configuration
+    # -----------------------------------------------------------------------
+    - name: Save running configuration to startup
+      cisco.ios.ios_config:
+        save_when: always
+
+    # -----------------------------------------------------------------------
+    # Step 5 — Verify configuration was applied
+    # -----------------------------------------------------------------------
+    - name: Retrieve SNMP host configuration
+      cisco.ios.ios_command:
+        commands:
+          - "show snmp host"
+          - "show snmp community"
+          - "show running-config | section snmp"
+      register: snmp_verify
+
+    - name: Assert trap destination is present in running config
+      ansible.builtin.assert:
+        that:
+          - logicmonitor_ip in snmp_verify.stdout[0]
+        fail_msg: >-
+          Trap destination {{ logicmonitor_ip }} was not found in 'show snmp host'.
+          Review the job output and verify the configuration was accepted.
+        success_msg: "Trap destination {{ logicmonitor_ip }} confirmed in SNMP host table."
+
+    - name: Assert community string is present in running config
+      ansible.builtin.assert:
+        that:
+          - snmp_community in snmp_verify.stdout[2]
+        fail_msg: >-
+          Community string '{{ snmp_community }}' was not found in running config.
+        success_msg: "Community string '{{ snmp_community }}' confirmed in running config."
+
+    - name: Print SNMP configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "===== SNMP Trap Configuration Summary ====="
+          - "Host              : {{ inventory_hostname }}"
+          - "Community         : {{ snmp_community }} (RW)"
+          - "Trap Destination  : {{ logicmonitor_ip }}"
+          - "Trap Source Intf  : {{ snmp_trap_source }}"
+          - "Traps Enabled     : snmp linkup/linkdown, bgp, config"
+          - ""
+          - "--- show snmp host ---"
+          - "{{ snmp_verify.stdout[0] }}"
+          - ""
+          - "--- show snmp community ---"
+          - "{{ snmp_verify.stdout[1] }}"

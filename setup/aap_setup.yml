@@ -394,7 +394,40 @@
         state: present
 
   # =========================================================================
-  # BLOCK 7 — Summary
+  # BLOCK 7 — Job Template: Cisco SNMP Trap Configuration
+  # =========================================================================
+
+    - name: Create job template — LM Cisco SNMP Trap Configuration
+      ansible.controller.job_template:
+        name: "LM - Cisco SNMP Trap Configuration"
+        organization: "{{ aap_organization }}"
+        project: "{{ aap_project_name }}"
+        playbook: "playbooks/cisco_snmp_trap.yml"
+        inventory: "{{ network_inventory }}"
+        credentials:
+          - "{{ cisco_credential_name }}"
+        description: >-
+          Configures SNMPv2c community string, trap destination (LogicMonitor collector),
+          trap source interface (Tunnel1), and enables linkup/linkdown, BGP, and config traps
+          on all hosts in the 'cisco' inventory group.
+          Requires logicmonitor_ip to be passed as an extra variable or via survey.
+        ask_variables_on_launch: true
+        survey_enabled: true
+        survey_spec:
+          name: "SNMP Trap Configuration Survey"
+          description: "Provide the LogicMonitor collector IP for SNMP trap delivery"
+          spec:
+            - question_name: "LogicMonitor Collector IP"
+              question_description: "IP address of the LogicMonitor collector that will receive SNMP traps"
+              variable: logicmonitor_ip
+              type: text
+              required: true
+              min: 7
+              max: 15
+        state: present
+
+  # =========================================================================
+  # BLOCK 8 — Summary
   # =========================================================================
 
     - name: Setup complete — print object summary
@@ -410,6 +443,7 @@
           - "  - LM - Cisco Interface No-Shut"
           - "  - LM - CPU High HTTPD Restart"
           - "  - LM - Disk Space Cleanup"
+          - "  - LM - Cisco SNMP Trap Configuration"
           - ""
           - "Workflow Templates:"
           - "  - LM - Cisco Interface Remediation"
@@ -422,3 +456,4 @@
           - "  3. Configure LogicMonitor HTTP Integration to POST to http://<eda-host>:5000"
           - "  4. Verify 'Network Devices' and 'Managed Servers' inventories contain hosts"
           - "  5. Verify '{{ server_credential_name }}' credential exists for server access"
+          - "  6. Run 'LM - Cisco SNMP Trap Configuration' with logicmonitor_ip survey answer"
