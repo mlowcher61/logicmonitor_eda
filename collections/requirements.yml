@@ -9,16 +9,16 @@
 
 collections:
   - name: ansible.eda
-    source: https://console.redhat.com/api/automation-hub/
+    # source: https://console.redhat.com/api/automation-hub/
 
   - name: ansible.controller
-    source: https://console.redhat.com/api/automation-hub/
+    # source: https://console.redhat.com/api/automation-hub/
 
   - name: servicenow.itsm
-    source: https://console.redhat.com/api/automation-hub/
+    # source: https://console.redhat.com/api/automation-hub/
 
   - name: cisco.ios
-    source: https://console.redhat.com/api/automation-hub/
+    #source: https://console.redhat.com/api/automation-hub/
 
   - name: ansible.windows
-    source: https://console.redhat.com/api/automation-hub/
+    # source: https://console.redhat.com/api/automation-hub/
