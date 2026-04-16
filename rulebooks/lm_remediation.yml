@@ -1,0 +1,133 @@
+---
+# LogicMonitor → EDA Auto-Remediation Rulebook
+#
+# PREREQUISITES:
+#   1. In EDA Controller: configure the AAP Controller token under
+#      "Controllers" so run_workflow_template can authenticate.
+#   2. In LogicMonitor: create an HTTP Integration pointed at
+#      http://<eda-host>:5000 with the JSON body template below.
+#   3. Port 5000 must be reachable from LogicMonitor on the EDA host.
+#
+# LogicMonitor HTTP Integration body template (paste into LM alert integration):
+# {
+#   "alertId":     "##ALERTID##",
+#   "alertStatus": "##ALERTSTATUS##",
+#   "severity":    "##LEVEL##",
+#   "host":        "##HOST##",
+#   "dataSource":  "##DATASOURCE##",
+#   "dataPoint":   "##DATAPOINT##",
+#   "instance":    "##INSTANCE##",
+#   "value":       "##VALUE##",
+#   "message":     "##MESSAGE##",
+#   "startEpoch":  "##STARTEPOCH##",
+#   "threshold":   "##THRESHOLD##",
+#   "deviceGroup": "##DEVICEGROUP##"
+# }
+#
+# LogicMonitor severity levels: warn | error | critical
+# LogicMonitor alertStatus values: active | acknowledged | cleared
+#
+# EDA Rulebook Activation settings:
+#   - Restart policy: Always
+#   - Max concurrent firings: 10 (adjust to your environment)
+#   - Enable event stream: Yes
+#   - AAP Controller token: <configured in EDA credentials>
+
+- name: LogicMonitor Auto-Remediation Rulebook
+  hosts: all
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+
+  rules:
+
+    # -----------------------------------------------------------------------
+    # Rule 1: Cisco Protected Interface Down
+    # Triggers when Tunnel0 or Tunnel1 reports ifOperStatus = 2 (down)
+    # LM datasource: Cisco_IOS_Interfaces (verify name in your LM instance)
+    # LM datapoint:  ifOperStatus  (SNMP OID 1.3.6.1.2.1.2.2.1.8 — 1=up, 2=down)
+    # -----------------------------------------------------------------------
+    - name: Cisco Protected Interface Down
+      condition: >
+        event.payload.alertStatus == "active" and
+        event.payload.dataPoint == "ifOperStatus" and
+        (event.payload.instance == "Tunnel0" or event.payload.instance == "Tunnel1")
+      action:
+        run_workflow_template:
+          name: "LM - Cisco Interface Remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              lm_alert_id: "{{ event.payload.alertId }}"
+              lm_host: "{{ event.payload.host }}"
+              lm_instance: "{{ event.payload.instance }}"
+              lm_datasource: "{{ event.payload.dataSource }}"
+              lm_datapoint: "{{ event.payload.dataPoint }}"
+              lm_value: "{{ event.payload.value }}"
+              lm_message: "{{ event.payload.message }}"
+              lm_severity: "{{ event.payload.severity }}"
+              lm_device_group: "{{ event.payload.deviceGroup }}"
+              snow_category: "Network"
+              snow_assignment_group: "Network Operations"
+              alert_type: "cisco_interface"
+
+    # -----------------------------------------------------------------------
+    # Rule 2: High CPU — Web Server Down
+    # Triggers when CPU exceeds 90% (web server is likely unresponsive)
+    # LM datasource: Linux_CPU or WinCPU (verify names in your LM instance)
+    # LM datapoint:  CPUBusyPercent
+    # -----------------------------------------------------------------------
+    - name: High CPU Utilization - Web Server Down
+      condition: >
+        event.payload.alertStatus == "active" and
+        event.payload.dataPoint == "CPUBusyPercent" and
+        event.payload.severity == "critical"
+      action:
+        run_workflow_template:
+          name: "LM - CPU High Utilization Remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              lm_alert_id: "{{ event.payload.alertId }}"
+              lm_host: "{{ event.payload.host }}"
+              lm_instance: "{{ event.payload.instance }}"
+              lm_datasource: "{{ event.payload.dataSource }}"
+              lm_datapoint: "{{ event.payload.dataPoint }}"
+              lm_value: "{{ event.payload.value }}"
+              lm_message: "{{ event.payload.message }}"
+              lm_severity: "{{ event.payload.severity }}"
+              lm_device_group: "{{ event.payload.deviceGroup }}"
+              snow_category: "Software"
+              snow_assignment_group: "Application Support"
+              alert_type: "cpu_high"
+
+    # -----------------------------------------------------------------------
+    # Rule 3: Disk Space Critical
+    # Triggers when a filesystem reaches 85%+ capacity
+    # LM datasource: Linux_Disk (verify name in your LM instance)
+    # LM datapoint:  Capacity (percentage used, integer 0-100)
+    # -----------------------------------------------------------------------
+    - name: Disk Space Critical
+      condition: >
+        event.payload.alertStatus == "active" and
+        event.payload.dataPoint == "Capacity" and
+        event.payload.severity != "warn"
+      action:
+        run_workflow_template:
+          name: "LM - Disk Space Remediation"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              lm_alert_id: "{{ event.payload.alertId }}"
+              lm_host: "{{ event.payload.host }}"
+              lm_instance: "{{ event.payload.instance }}"
+              lm_datasource: "{{ event.payload.dataSource }}"
+              lm_datapoint: "{{ event.payload.dataPoint }}"
+              lm_value: "{{ event.payload.value }}"
+              lm_message: "{{ event.payload.message }}"
+              lm_severity: "{{ event.payload.severity }}"
+              lm_device_group: "{{ event.payload.deviceGroup }}"
+              snow_category: "Infrastructure"
+              snow_assignment_group: "Server Operations"
+              alert_type: "disk_space"

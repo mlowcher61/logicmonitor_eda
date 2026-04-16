@@ -1,0 +1,261 @@
+---
+# Template 2b — CPU High Utilization Remediation (httpd restart)
+#
+# Remediates high CPU caused by an unresponsive web server by restarting
+# the httpd/Apache service. Handles both Linux (httpd/apache2) and Windows
+# (W3SVC — IIS). Updates ServiceNow with progress notes throughout.
+#
+# Required credentials attached to this job template:
+#   - Machine credential (SSH key/password for Linux, WinRM for Windows)
+#   - servicenow (Custom credential — injects SN_HOST/SN_USERNAME/SN_PASSWORD)
+#
+# Required extra vars (propagated from workflow artifacts + EDA):
+#   lm_host       — target server hostname (must match an inventory host)
+#   lm_value      — CPU % value that triggered the alert
+#   snow_sys_id   — ServiceNow incident sys_id
+#   snow_number   — ServiceNow incident number
+
+- name: CPU High Utilization — Restart Web Server Service
+  hosts: "{{ lm_host }}"
+  gather_facts: true
+
+  vars:
+    sn_host: "{{ lookup('env', 'SN_HOST') }}"
+    sn_username: "{{ lookup('env', 'SN_USERNAME') }}"
+    sn_password: "{{ lookup('env', 'SN_PASSWORD') }}"
+
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # Step 1 — Notify ServiceNow that remediation has started
+    # -----------------------------------------------------------------------
+    - name: SNOW — Update incident — remediation starting
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: in_progress
+        other:
+          work_notes: >-
+            [AAP] Remediation approved and started.
+            Target host: {{ lm_host }} ({{ ansible_os_family }}).
+            Reported CPU: {{ lm_value }}%.
+            Action: restart web server service.
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 2 — Linux: capture pre-restart state
+    # -----------------------------------------------------------------------
+    - name: Linux — Capture top CPU consumers (pre-restart)
+      ansible.builtin.shell: |
+        ps aux --sort=-%cpu | head -10
+      register: top_procs
+      changed_when: false
+      when: ansible_os_family != "Windows"
+
+    - name: Linux — SNOW — Record top processes
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] Top CPU processes on {{ lm_host }} before restart:
+            {{ top_procs.stdout }}
+      delegate_to: localhost
+      when: ansible_os_family != "Windows"
+
+    # -----------------------------------------------------------------------
+    # Step 3 — Linux: restart httpd / apache2
+    # -----------------------------------------------------------------------
+    - name: Linux — Restart httpd (RHEL/CentOS)
+      ansible.builtin.service:
+        name: httpd
+        state: restarted
+      register: httpd_restart_rhel
+      ignore_errors: true
+      when:
+        - ansible_os_family != "Windows"
+        - ansible_os_family == "RedHat"
+
+    - name: Linux — Restart apache2 (Debian/Ubuntu) if httpd not found
+      ansible.builtin.service:
+        name: apache2
+        state: restarted
+      register: httpd_restart_debian
+      when:
+        - ansible_os_family != "Windows"
+        - ansible_os_family == "Debian"
+
+    - name: Linux — SNOW — Record service restart
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] Web server service restarted on {{ lm_host }}.
+            Service: {{ 'httpd' if ansible_os_family == 'RedHat' else 'apache2' }}.
+            Waiting for service to become active.
+      delegate_to: localhost
+      when: ansible_os_family != "Windows"
+
+    # -----------------------------------------------------------------------
+    # Step 4 — Linux: verify httpd is active and responding
+    # -----------------------------------------------------------------------
+    - name: Linux — Verify httpd/apache2 service is running
+      ansible.builtin.service_facts:
+      when: ansible_os_family != "Windows"
+
+    - name: Linux — Assert web service is active
+      ansible.builtin.assert:
+        that:
+          - >-
+            (ansible_facts.services['httpd.service'] is defined and
+             ansible_facts.services['httpd.service'].state == 'running') or
+            (ansible_facts.services['apache2.service'] is defined and
+             ansible_facts.services['apache2.service'].state == 'running')
+        fail_msg: >-
+          Web server service did not come back up after restart on {{ lm_host }}.
+          Manual investigation required.
+      when: ansible_os_family != "Windows"
+
+    - name: Linux — Test HTTP response on localhost
+      ansible.builtin.uri:
+        url: "http://localhost"
+        method: GET
+        status_code: [200, 301, 302, 403]
+        timeout: 10
+      register: http_check
+      ignore_errors: true
+      when: ansible_os_family != "Windows"
+
+    # -----------------------------------------------------------------------
+    # Step 5 — Windows: capture pre-restart IIS state
+    # -----------------------------------------------------------------------
+    - name: Windows — Capture IIS worker processes (pre-restart)
+      ansible.windows.win_shell: |
+        Get-Process | Where-Object { $_.Name -like "w3wp*" } |
+        Select-Object -Property Name, CPU, WorkingSet |
+        Format-Table | Out-String
+      register: iis_procs
+      changed_when: false
+      when: ansible_os_family == "Windows"
+
+    - name: Windows — SNOW — Record IIS worker processes
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] IIS worker processes on {{ lm_host }} before restart:
+            {{ iis_procs.stdout }}
+      delegate_to: localhost
+      when: ansible_os_family == "Windows"
+
+    # -----------------------------------------------------------------------
+    # Step 6 — Windows: restart IIS (W3SVC)
+    # -----------------------------------------------------------------------
+    - name: Windows — Restart World Wide Web Publishing Service (W3SVC)
+      ansible.windows.win_service:
+        name: W3SVC
+        state: restarted
+      when: ansible_os_family == "Windows"
+
+    - name: Windows — SNOW — Record IIS restart
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] IIS (W3SVC) restarted on {{ lm_host }}.
+            Verifying service state.
+      delegate_to: localhost
+      when: ansible_os_family == "Windows"
+
+    # -----------------------------------------------------------------------
+    # Step 7 — Windows: verify IIS is running
+    # -----------------------------------------------------------------------
+    - name: Windows — Verify W3SVC is running
+      ansible.windows.win_service:
+        name: W3SVC
+      register: w3svc_state
+      when: ansible_os_family == "Windows"
+
+    - name: Windows — Assert IIS is running
+      ansible.builtin.assert:
+        that:
+          - w3svc_state.state == "started"
+        fail_msg: "IIS (W3SVC) failed to start on {{ lm_host }}. Manual investigation required."
+      when: ansible_os_family == "Windows"
+
+    # -----------------------------------------------------------------------
+    # Step 8 — Resolve the ServiceNow incident
+    # -----------------------------------------------------------------------
+    - name: SNOW — Resolve incident as successfully remediated
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: resolved
+        close_code: "Solved (Permanently)"
+        close_notes: >-
+          Auto-remediation completed successfully by Ansible Automation Platform.
+
+          Summary:
+          - Host      : {{ lm_host }} ({{ ansible_os_family }})
+          - Alert     : CPU at {{ lm_value }}% — web server unresponsive
+          - Action    : Web server service restarted
+          - Service   : {% if ansible_os_family == 'Windows' %}W3SVC (IIS)
+                        {% elif ansible_os_family == 'RedHat' %}httpd
+                        {% else %}apache2{% endif %}
+          - HTTP Check: {{ 'Passed (' + (http_check.status | string) + ')' if http_check is defined and http_check.status is defined else 'Not performed (Windows)' }}
+
+          LogicMonitor Alert ID: {{ lm_alert_id }}
+          Resolved by: AAP auto-remediation workflow
+        other:
+          work_notes: "[AAP] Web server service confirmed running. Incident resolved."
+      delegate_to: localhost
+
+    - name: Print remediation summary
+      ansible.builtin.debug:
+        msg:
+          - "Remediation complete."
+          - "Host   : {{ lm_host }}"
+          - "OS     : {{ ansible_os_family }}"
+          - "SNOW   : {{ snow_number }} resolved"
+
+  rescue:
+    - name: SNOW — Mark incident as requiring manual intervention
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: in_progress
+        other:
+          work_notes: >-
+            [AAP] ERROR: Automated web server restart failed on {{ lm_host }}.
+            The service may not have come back up or the host was unreachable.
+            Manual intervention is required.
+            LogicMonitor Alert ID: {{ lm_alert_id }}
+      delegate_to: localhost
+
+    - name: Fail the job so the workflow reflects failure
+      ansible.builtin.fail:
+        msg: "Web server remediation failed — manual intervention required."

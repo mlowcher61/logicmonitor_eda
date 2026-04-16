@@ -1,0 +1,114 @@
+---
+# Template 1 — Create ServiceNow Incident
+#
+# This playbook is the first node in every remediation workflow.
+# It opens a ServiceNow incident pre-populated with LogicMonitor alert data,
+# then publishes snow_sys_id and snow_number as workflow artifacts so all
+# downstream nodes can update and resolve the same ticket.
+#
+# Required custom credential (type: ServiceNow) must be attached to this
+# job template. It injects:
+#   SN_HOST      — ServiceNow instance URL
+#   SN_USERNAME  — ServiceNow username
+#   SN_PASSWORD  — ServiceNow password
+#
+# Required extra vars (passed from EDA via the workflow):
+#   lm_alert_id, lm_host, lm_instance, lm_datasource, lm_datapoint,
+#   lm_value, lm_message, lm_severity, lm_device_group,
+#   snow_category, snow_assignment_group, alert_type
+
+- name: Create ServiceNow Incident from LogicMonitor Alert
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    sn_host: "{{ lookup('env', 'SN_HOST') }}"
+    sn_username: "{{ lookup('env', 'SN_USERNAME') }}"
+    sn_password: "{{ lookup('env', 'SN_PASSWORD') }}"
+
+    # Map LM severity to ServiceNow urgency (1=High 2=Medium 3=Low)
+    severity_to_urgency:
+      critical: "1"
+      error: "2"
+      warn: "3"
+
+    # Map LM severity to ServiceNow impact
+    severity_to_impact:
+      critical: "1"
+      error: "2"
+      warn: "3"
+
+    sn_urgency: "{{ severity_to_urgency[lm_severity] | default('2') }}"
+    sn_impact:  "{{ severity_to_impact[lm_severity]  | default('2') }}"
+
+    incident_description: |
+      == AUTO-GENERATED INCIDENT — LogicMonitor Alert ==
+
+      Alert ID     : {{ lm_alert_id }}
+      Alert Type   : {{ alert_type }}
+      Severity     : {{ lm_severity | upper }}
+      Device       : {{ lm_host }}
+      Device Group : {{ lm_device_group | default('N/A') }}
+      DataSource   : {{ lm_datasource }}
+      DataPoint    : {{ lm_datapoint }}
+      Instance     : {{ lm_instance | default('N/A') }}
+      Current Value: {{ lm_value }}
+
+      Alert Message:
+      {{ lm_message }}
+
+      == REMEDIATION ==
+      An automated remediation workflow has been triggered in
+      Ansible Automation Platform. This incident will be updated
+      with progress notes and resolved upon successful completion.
+
+      Workflow approval is required before remediation begins.
+
+  tasks:
+    - name: Validate required environment variables are present
+      ansible.builtin.assert:
+        that:
+          - sn_host | length > 0
+          - sn_username | length > 0
+          - sn_password | length > 0
+        fail_msg: >-
+          ServiceNow credential environment variables are missing.
+          Ensure the 'servicenow' custom credential is attached to this job template.
+
+    - name: Create ServiceNow incident
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        state: new
+        caller_id: "{{ sn_username }}"
+        short_description: >-
+          [LogicMonitor Auto-Remediation] {{ lm_severity | upper }} alert on
+          {{ lm_host }} — {{ lm_datasource }}/{{ lm_datapoint }}
+        description: "{{ incident_description }}"
+        impact: "{{ sn_impact }}"
+        urgency: "{{ sn_urgency }}"
+        category: "{{ snow_category }}"
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          work_notes: >-
+            [AAP] Incident created automatically by Ansible Event-Driven Automation.
+            LogicMonitor Alert ID: {{ lm_alert_id }}.
+            Awaiting workflow approval before remediation begins.
+      register: snow_incident
+
+    - name: Print incident details
+      ansible.builtin.debug:
+        msg:
+          - "ServiceNow incident created successfully."
+          - "Incident Number : {{ snow_incident.record.number }}"
+          - "Sys ID          : {{ snow_incident.record.sys_id }}"
+          - "State           : {{ snow_incident.record.state }}"
+
+    - name: Publish incident identifiers as workflow artifacts
+      ansible.builtin.set_stats:
+        data:
+          snow_sys_id: "{{ snow_incident.record.sys_id }}"
+          snow_number: "{{ snow_incident.record.number }}"
+        per_host: false

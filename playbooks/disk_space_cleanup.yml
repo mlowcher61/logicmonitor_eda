@@ -1,0 +1,295 @@
+---
+# Template 2c — Disk Space Remediation (safe cleanup)
+#
+# Remediates high disk utilization on Linux servers by performing a
+# targeted, non-destructive cleanup:
+#   1. Clears /tmp files older than 7 days
+#   2. Removes rotated/compressed log archives older than 30 days
+#   3. Vacuums systemd journal logs down to 200 MB
+#
+# Updates ServiceNow with before/after disk stats and work notes,
+# then resolves the incident if disk usage has dropped below 80%.
+#
+# Required credentials attached to this job template:
+#   - Machine credential (SSH key/password)
+#   - servicenow (Custom credential — injects SN_HOST/SN_USERNAME/SN_PASSWORD)
+#
+# Required extra vars (propagated from workflow artifacts + EDA):
+#   lm_host       — target server hostname (must match an inventory host)
+#   lm_instance   — filesystem mount point reported by LM (e.g., /dev/sda1)
+#   lm_value      — disk usage % that triggered the alert
+#   snow_sys_id   — ServiceNow incident sys_id
+#   snow_number   — ServiceNow incident number
+
+- name: Disk Space Critical — Safe Cleanup
+  hosts: "{{ lm_host }}"
+  gather_facts: true
+  become: true
+
+  vars:
+    sn_host: "{{ lookup('env', 'SN_HOST') }}"
+    sn_username: "{{ lookup('env', 'SN_USERNAME') }}"
+    sn_password: "{{ lookup('env', 'SN_PASSWORD') }}"
+    tmp_age_days: 7
+    log_archive_age_days: 30
+    journal_max_size: "200M"
+    disk_threshold_ok: 80   # Target: disk must be below this after cleanup
+
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # Step 1 — Notify ServiceNow that remediation has started
+    # -----------------------------------------------------------------------
+    - name: SNOW — Update incident — remediation starting
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: in_progress
+        other:
+          work_notes: >-
+            [AAP] Remediation approved and started.
+            Target host: {{ lm_host }}.
+            Reported disk utilization: {{ lm_value }}% on {{ lm_instance }}.
+            Beginning safe disk cleanup — only /tmp and old log archives will be removed.
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 2 — Capture pre-cleanup disk usage
+    # -----------------------------------------------------------------------
+    - name: Capture disk usage before cleanup
+      ansible.builtin.shell: df -h
+      register: df_before
+      changed_when: false
+
+    - name: SNOW — Record pre-cleanup disk state
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] Disk usage on {{ lm_host }} before cleanup:
+            {{ df_before.stdout }}
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 3 — Find stale /tmp files
+    # -----------------------------------------------------------------------
+    - name: Find /tmp files older than {{ tmp_age_days }} days
+      ansible.builtin.find:
+        paths: /tmp
+        age: "{{ tmp_age_days }}d"
+        recurse: true
+        file_type: file
+      register: tmp_files
+
+    - name: Remove stale /tmp files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ tmp_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: tmp_files.matched > 0
+
+    - name: SNOW — Record /tmp cleanup
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] /tmp cleanup completed.
+            Files removed: {{ tmp_files.matched }}
+            Space freed: {{ (tmp_files.files | map(attribute='size') | sum / 1024 / 1024) | round(1) }} MB
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 4 — Remove old rotated log archives
+    # -----------------------------------------------------------------------
+    - name: Find compressed log archives older than {{ log_archive_age_days }} days
+      ansible.builtin.find:
+        paths: /var/log
+        patterns: "*.gz,*.bz2,*.xz"
+        age: "{{ log_archive_age_days }}d"
+        recurse: true
+        file_type: file
+      register: old_log_archives
+
+    - name: Remove old log archives
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_log_archives.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: old_log_archives.matched > 0
+
+    - name: SNOW — Record log archive cleanup
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] Old log archive cleanup completed.
+            Archives removed: {{ old_log_archives.matched }}
+            Space freed: {{ (old_log_archives.files | map(attribute='size') | sum / 1024 / 1024) | round(1) }} MB
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 5 — Vacuum systemd journal (if present)
+    # -----------------------------------------------------------------------
+    - name: Check if journalctl is available
+      ansible.builtin.command: which journalctl
+      register: journalctl_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Vacuum systemd journal to {{ journal_max_size }}
+      ansible.builtin.command: "journalctl --vacuum-size={{ journal_max_size }}"
+      register: journal_vacuum
+      changed_when: "'Vacuuming done' in journal_vacuum.stdout"
+      when: journalctl_check.rc == 0
+
+    - name: SNOW — Record journal vacuum results
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] Systemd journal vacuum completed.
+            {{ journal_vacuum.stdout | default('journalctl not available on this host') }}
+      delegate_to: localhost
+      when: journalctl_check.rc == 0
+
+    # -----------------------------------------------------------------------
+    # Step 6 — Capture post-cleanup disk usage and verify improvement
+    # -----------------------------------------------------------------------
+    - name: Capture disk usage after cleanup
+      ansible.builtin.shell: df -h
+      register: df_after
+      changed_when: false
+
+    - name: Get numeric disk usage percentage after cleanup
+      ansible.builtin.shell: |
+        df --output=pcent "{{ lm_instance }}" | tail -1 | tr -d ' %'
+      register: disk_pct_after
+      changed_when: false
+      ignore_errors: true
+
+    - name: SNOW — Record post-cleanup disk state
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] Disk usage on {{ lm_host }} after cleanup:
+            {{ df_after.stdout }}
+            Current utilization on {{ lm_instance }}: {{ disk_pct_after.stdout | default('unknown') }}%
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 7 — Resolve or escalate depending on post-cleanup disk level
+    # -----------------------------------------------------------------------
+    - name: Resolve incident — disk usage reduced below threshold
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: resolved
+        close_code: "Solved (Permanently)"
+        close_notes: >-
+          Auto-remediation completed successfully by Ansible Automation Platform.
+
+          Summary:
+          - Host              : {{ lm_host }}
+          - Filesystem        : {{ lm_instance }}
+          - Alert threshold   : {{ lm_value }}% (before cleanup)
+          - After cleanup     : {{ disk_pct_after.stdout | default('N/A') }}%
+
+          Actions taken:
+          1. Removed {{ tmp_files.matched }} stale files from /tmp
+             ({{ (tmp_files.files | map(attribute='size') | sum / 1024 / 1024) | round(1) }} MB freed)
+          2. Removed {{ old_log_archives.matched }} old compressed log archives
+             ({{ (old_log_archives.files | map(attribute='size') | sum / 1024 / 1024) | round(1) }} MB freed)
+          3. Vacuumed systemd journal to {{ journal_max_size }}
+
+          LogicMonitor Alert ID: {{ lm_alert_id }}
+          Resolved by: AAP auto-remediation workflow
+        other:
+          work_notes: "[AAP] Disk usage reduced. Incident resolved."
+      delegate_to: localhost
+      when: >-
+        disk_pct_after.rc != 0 or
+        (disk_pct_after.stdout | int) < disk_threshold_ok
+
+    - name: Escalate incident — disk still critical after cleanup
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: in_progress
+        urgency: "1"
+        impact: "1"
+        other:
+          work_notes: >-
+            [AAP] WARNING: Automated cleanup ran but disk usage on {{ lm_instance }}
+            is still at {{ disk_pct_after.stdout }}% (threshold: {{ disk_threshold_ok }}%).
+            Automated cleanup has exhausted safe options.
+            MANUAL INVESTIGATION REQUIRED — additional disk space must be provisioned
+            or application logs must be reviewed and archived by an administrator.
+      delegate_to: localhost
+      when:
+        - disk_pct_after.rc == 0
+        - (disk_pct_after.stdout | int) >= disk_threshold_ok
+
+    - name: Print remediation summary
+      ansible.builtin.debug:
+        msg:
+          - "Disk cleanup complete."
+          - "Host         : {{ lm_host }}"
+          - "Filesystem   : {{ lm_instance }}"
+          - "Before       : {{ lm_value }}%"
+          - "After        : {{ disk_pct_after.stdout | default('unknown') }}%"
+          - "SNOW         : {{ snow_number }}"
+
+  rescue:
+    - name: SNOW — Mark incident as requiring manual intervention
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: in_progress
+        other:
+          work_notes: >-
+            [AAP] ERROR: Automated disk cleanup failed on {{ lm_host }}.
+            The host may be unreachable or cleanup tasks encountered unexpected errors.
+            Manual intervention is required.
+            LogicMonitor Alert ID: {{ lm_alert_id }}
+      delegate_to: localhost
+
+    - name: Fail the job so the workflow reflects failure
+      ansible.builtin.fail:
+        msg: "Disk space remediation failed — manual intervention required."

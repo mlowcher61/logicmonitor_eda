@@ -1,0 +1,190 @@
+---
+# Template 2a — Cisco Protected Interface Remediation (no shutdown)
+#
+# Remediates a downed Tunnel0 or Tunnel1 interface on a Cisco IOS router.
+# Updates the ServiceNow incident with progress work notes throughout,
+# and resolves the incident upon successful completion.
+#
+# Required credentials attached to this job template:
+#   - net_cred  (Machine credential — SSH username/password or SSH key)
+#   - servicenow (Custom credential — injects SN_HOST/SN_USERNAME/SN_PASSWORD)
+#
+# Required extra vars (propagated from workflow artifacts + EDA):
+#   lm_host       — router hostname (must match an inventory host)
+#   lm_instance   — interface name to recover (e.g., Tunnel0, Tunnel1)
+#   snow_sys_id   — ServiceNow incident sys_id (set by snow_create_incident.yml)
+#   snow_number   — ServiceNow incident number (for display only)
+
+- name: Cisco IOS — No-Shut Protected Interface
+  hosts: "{{ lm_host }}"
+  gather_facts: false
+  connection: network_cli
+  vars:
+    ansible_network_os: cisco.ios.ios
+    sn_host: "{{ lookup('env', 'SN_HOST') }}"
+    sn_username: "{{ lookup('env', 'SN_USERNAME') }}"
+    sn_password: "{{ lookup('env', 'SN_PASSWORD') }}"
+
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # Step 1 — Notify ServiceNow that remediation has started
+    # -----------------------------------------------------------------------
+    - name: SNOW — Update incident — remediation starting
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: in_progress
+        other:
+          work_notes: >-
+            [AAP] Remediation approved and started.
+            Target device: {{ lm_host }}.
+            Action: issue 'no shutdown' on interface {{ lm_instance }}.
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 2 — Capture pre-remediation interface state
+    # -----------------------------------------------------------------------
+    - name: Capture current interface status (pre-remediation)
+      cisco.ios.ios_command:
+        commands:
+          - "show interface {{ lm_instance }}"
+          - "show interface {{ lm_instance }} | include line protocol"
+      register: pre_status
+
+    - name: SNOW — Record pre-remediation status
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] Pre-remediation interface state captured.
+            {{ pre_status.stdout_lines[1] | join(' ') }}
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 3 — Issue no shutdown
+    # -----------------------------------------------------------------------
+    - name: Apply no shutdown to interface {{ lm_instance }}
+      cisco.ios.ios_config:
+        lines:
+          - no shutdown
+        parents: "interface {{ lm_instance }}"
+        save_when: changed
+
+    - name: SNOW — Record no-shutdown issued
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] 'no shutdown' command issued on interface {{ lm_instance }}.
+            Waiting for interface to come up.
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 4 — Verify interface is back up (retry up to 12 times / 60 sec)
+    # -----------------------------------------------------------------------
+    - name: Wait for interface {{ lm_instance }} to reach up/up state
+      cisco.ios.ios_command:
+        commands:
+          - "show interface {{ lm_instance }} | include line protocol"
+        wait_for:
+          - result[0] contains "line protocol is up"
+        interval: 5
+        retries: 12
+      register: post_status
+
+    - name: SNOW — Record interface is up
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        other:
+          work_notes: >-
+            [AAP] Interface {{ lm_instance }} on {{ lm_host }} is confirmed UP.
+            Post-remediation state: {{ post_status.stdout_lines[0] | join(' ') }}
+      delegate_to: localhost
+
+    # -----------------------------------------------------------------------
+    # Step 5 — Collect running config snippet for audit trail
+    # -----------------------------------------------------------------------
+    - name: Capture running config for the interface
+      cisco.ios.ios_command:
+        commands:
+          - "show running-config interface {{ lm_instance }}"
+      register: intf_config
+
+    # -----------------------------------------------------------------------
+    # Step 6 — Resolve the ServiceNow incident
+    # -----------------------------------------------------------------------
+    - name: SNOW — Resolve incident as successfully remediated
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: resolved
+        close_code: "Solved (Permanently)"
+        close_notes: >-
+          Auto-remediation completed successfully by Ansible Automation Platform.
+
+          Summary:
+          - Device    : {{ lm_host }}
+          - Interface : {{ lm_instance }}
+          - Action    : 'no shutdown' applied via Cisco IOS CLI
+          - Result    : Interface confirmed UP/UP after remediation
+
+          Running config after remediation:
+          {{ intf_config.stdout[0] }}
+
+          LogicMonitor Alert ID: {{ lm_alert_id }}
+          Resolved by: AAP auto-remediation workflow
+        other:
+          work_notes: "[AAP] Incident resolved. Interface {{ lm_instance }} is operational."
+      delegate_to: localhost
+
+    - name: Print remediation summary
+      ansible.builtin.debug:
+        msg:
+          - "Remediation complete."
+          - "Device    : {{ lm_host }}"
+          - "Interface : {{ lm_instance }}"
+          - "SNOW      : {{ snow_number }} resolved"
+
+  # -----------------------------------------------------------------------
+  # Rescue block — update SNOW if remediation fails
+  # -----------------------------------------------------------------------
+  rescue:
+    - name: SNOW — Mark incident as requiring manual intervention
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_host }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_sys_id }}"
+        state: in_progress
+        other:
+          work_notes: >-
+            [AAP] ERROR: Automated remediation failed for interface {{ lm_instance }}
+            on device {{ lm_host }}.
+            Manual intervention is required.
+            Please review the AAP job log for details.
+            LogicMonitor Alert ID: {{ lm_alert_id }}
+      delegate_to: localhost
+
+    - name: Fail the job so the workflow reflects failure
+      ansible.builtin.fail:
+        msg: "Cisco interface remediation failed — manual intervention required."

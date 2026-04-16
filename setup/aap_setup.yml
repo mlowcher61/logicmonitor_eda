@@ -1,0 +1,424 @@
+---
+# AAP Setup Playbook — LogicMonitor Auto-Remediation
+#
+# Run this playbook once to provision all required AAP objects:
+#   - ServiceNow custom credential type
+#   - ServiceNow credential (servicenow)
+#   - Localhost inventory + host
+#   - 4 job templates
+#   - 3 workflow templates, each with approval nodes
+#
+# Prerequisites:
+#   1. A Project named "LogicMonitor Automation" (see aap_project_name var)
+#      must exist in AAP and be synced with the SCM repo containing the
+#      playbooks in ../playbooks/
+#   2. Inventories "Network Devices" and "Managed Servers" must exist
+#      and contain the appropriate hosts.
+#   3. A Machine credential named "net_cred" must exist for Cisco SSH access.
+#   4. A Machine credential must exist for Linux/Windows server access.
+#      Update the server_credential var below.
+#
+# AAP controller connection is read from environment variables:
+#   CONTROLLER_HOST, CONTROLLER_USERNAME, CONTROLLER_PASSWORD
+# or set them below in the vars section.
+#
+# Usage:
+#   export CONTROLLER_HOST=https://your-aap-controller.example.com
+#   export CONTROLLER_USERNAME=admin
+#   export CONTROLLER_PASSWORD=yourpassword
+#   ansible-playbook setup/aap_setup.yml
+
+- name: Provision AAP objects for LogicMonitor Auto-Remediation
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars:
+    aap_organization: "Default"
+    aap_project_name: "LogicMonitor Automation"
+
+    # Inventory names — "Network Devices" and "Managed Servers" must pre-exist
+    network_inventory: "Network Devices"
+    server_inventory: "Managed Servers"
+    localhost_inventory: "Localhost"
+
+    # Credential names
+    snow_credential_name: "servicenow"
+    cisco_credential_name: "net_cred"
+    server_credential_name: "linux_server_cred"   # Update to match your credential
+
+    # ServiceNow connection details — stored in the custom credential
+    # WARNING: Move sn_password out of plaintext before running in production.
+    #          Use -e @vault_file.yml with ansible-vault instead.
+    sn_host: "https://ven07621.service-now.com"
+    sn_username: "mlowcher"
+    sn_password: "R3dh@t123!"
+
+    # Workflow approval timeout in seconds (3600 = 1 hour)
+    approval_timeout: 3600
+
+  # =========================================================================
+  # BLOCK 1 — ServiceNow Custom Credential Type
+  # =========================================================================
+  tasks:
+
+    - name: Create ServiceNow custom credential type
+      ansible.controller.credential_type:
+        name: "ServiceNow"
+        kind: cloud
+        description: >-
+          ServiceNow ITSM credential. Injects SN_HOST, SN_USERNAME,
+          and SN_PASSWORD as environment variables.
+        inputs:
+          fields:
+            - id: sn_host
+              type: string
+              label: "ServiceNow Instance URL"
+              help_text: "e.g. https://yourinstance.service-now.com"
+            - id: sn_username
+              type: string
+              label: "Username"
+            - id: sn_password
+              type: string
+              label: "Password"
+              secret: true
+          required:
+            - sn_host
+            - sn_username
+            - sn_password
+        injectors:
+          env:
+            SN_HOST: !unsafe "{{ sn_host }}"
+            SN_USERNAME: !unsafe "{{ sn_username }}"
+            SN_PASSWORD: !unsafe "{{ sn_password }}"
+        state: present
+
+    - name: Create ServiceNow credential
+      ansible.controller.credential:
+        name: "{{ snow_credential_name }}"
+        organization: "{{ aap_organization }}"
+        credential_type: "ServiceNow"
+        description: "ServiceNow instance credentials for auto-remediation workflows"
+        inputs:
+          sn_host: "{{ sn_host }}"
+          sn_username: "{{ sn_username }}"
+          sn_password: "{{ sn_password }}"
+        state: present
+
+  # =========================================================================
+  # BLOCK 2 — Localhost Inventory
+  # =========================================================================
+
+    - name: Create Localhost inventory
+      ansible.controller.inventory:
+        name: "{{ localhost_inventory }}"
+        organization: "{{ aap_organization }}"
+        description: "Localhost inventory for ServiceNow ITSM tasks"
+        state: present
+
+    - name: Add localhost host to Localhost inventory
+      ansible.controller.host:
+        name: localhost
+        inventory: "{{ localhost_inventory }}"
+        variables:
+          ansible_connection: local
+          ansible_python_interpreter: "{{ ansible_playbook_python }}"
+        state: present
+
+  # =========================================================================
+  # BLOCK 3 — Job Templates
+  # =========================================================================
+
+    - name: Create job template — LM Create ServiceNow Incident
+      ansible.controller.job_template:
+        name: "LM - Create ServiceNow Incident"
+        organization: "{{ aap_organization }}"
+        project: "{{ aap_project_name }}"
+        playbook: "playbooks/snow_create_incident.yml"
+        inventory: "{{ localhost_inventory }}"
+        credentials:
+          - "{{ snow_credential_name }}"
+        description: >-
+          Opens a ServiceNow incident populated with LogicMonitor alert data.
+          First node in every remediation workflow.
+        ask_variables_on_launch: true
+        state: present
+
+    - name: Create job template — LM Cisco Interface No-Shut
+      ansible.controller.job_template:
+        name: "LM - Cisco Interface No-Shut"
+        organization: "{{ aap_organization }}"
+        project: "{{ aap_project_name }}"
+        playbook: "playbooks/cisco_no_shut.yml"
+        inventory: "{{ network_inventory }}"
+        credentials:
+          - "{{ cisco_credential_name }}"
+          - "{{ snow_credential_name }}"
+        description: >-
+          Issues 'no shutdown' on a protected Cisco IOS interface (Tunnel0/Tunnel1),
+          verifies the interface comes up, and resolves the ServiceNow incident.
+        ask_variables_on_launch: true
+        state: present
+
+    - name: Create job template — LM CPU High HTTPD Restart
+      ansible.controller.job_template:
+        name: "LM - CPU High HTTPD Restart"
+        organization: "{{ aap_organization }}"
+        project: "{{ aap_project_name }}"
+        playbook: "playbooks/cpu_httpd_restart.yml"
+        inventory: "{{ server_inventory }}"
+        credentials:
+          - "{{ server_credential_name }}"
+          - "{{ snow_credential_name }}"
+        description: >-
+          Restarts the web server (httpd/apache2 on Linux, W3SVC on Windows)
+          in response to high CPU / web service down alert.
+        ask_variables_on_launch: true
+        become_enabled: true
+        state: present
+
+    - name: Create job template — LM Disk Space Cleanup
+      ansible.controller.job_template:
+        name: "LM - Disk Space Cleanup"
+        organization: "{{ aap_organization }}"
+        project: "{{ aap_project_name }}"
+        playbook: "playbooks/disk_space_cleanup.yml"
+        inventory: "{{ server_inventory }}"
+        credentials:
+          - "{{ server_credential_name }}"
+          - "{{ snow_credential_name }}"
+        description: >-
+          Cleans /tmp, old log archives, and journals to recover disk space.
+          Resolves the ServiceNow incident if disk drops below 80% after cleanup.
+        ask_variables_on_launch: true
+        become_enabled: true
+        state: present
+
+  # =========================================================================
+  # BLOCK 4 — Workflow: Cisco Interface Remediation
+  # =========================================================================
+
+    - name: Create workflow template — LM Cisco Interface Remediation
+      ansible.controller.workflow_job_template:
+        name: "LM - Cisco Interface Remediation"
+        organization: "{{ aap_organization }}"
+        description: >-
+          End-to-end remediation for a downed Cisco protected interface.
+          Opens SNOW incident → waits for approval → no-shuts the interface → resolves SNOW.
+        ask_variables_on_launch: true
+        state: present
+
+    # --- Cisco workflow nodes ---
+
+    - name: Cisco WF — Create SNOW incident node
+      ansible.controller.workflow_job_template_node:
+        identifier: "cisco_node_snow"
+        workflow_job_template: "LM - Cisco Interface Remediation"
+        unified_job_template: "LM - Create ServiceNow Incident"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    - name: Cisco WF — Create approval node
+      ansible.controller.workflow_job_template_node:
+        identifier: "cisco_node_approval"
+        workflow_job_template: "LM - Cisco Interface Remediation"
+        approval_node:
+          name: "Approve Cisco Interface Remediation"
+          description: >-
+            LogicMonitor detected a downed protected interface.
+            Review the ServiceNow incident and approve to execute
+            'no shutdown' on the identified Cisco IOS interface.
+          timeout: "{{ approval_timeout }}"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    - name: Cisco WF — Create remediation node
+      ansible.controller.workflow_job_template_node:
+        identifier: "cisco_node_remediation"
+        workflow_job_template: "LM - Cisco Interface Remediation"
+        unified_job_template: "LM - Cisco Interface No-Shut"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    # --- Cisco workflow node links ---
+
+    - name: Cisco WF — Link SNOW incident → approval (on success)
+      ansible.controller.workflow_job_template_node:
+        identifier: "cisco_node_snow"
+        workflow_job_template: "LM - Cisco Interface Remediation"
+        success_nodes:
+          - "cisco_node_approval"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    - name: Cisco WF — Link approval → remediation (on approve)
+      ansible.controller.workflow_job_template_node:
+        identifier: "cisco_node_approval"
+        workflow_job_template: "LM - Cisco Interface Remediation"
+        success_nodes:
+          - "cisco_node_remediation"
+        organization: "{{ aap_organization }}"
+        state: present
+
+  # =========================================================================
+  # BLOCK 5 — Workflow: CPU High Utilization Remediation
+  # =========================================================================
+
+    - name: Create workflow template — LM CPU High Utilization Remediation
+      ansible.controller.workflow_job_template:
+        name: "LM - CPU High Utilization Remediation"
+        organization: "{{ aap_organization }}"
+        description: >-
+          End-to-end remediation for high CPU / web server down.
+          Opens SNOW incident → waits for approval → restarts httpd/IIS → resolves SNOW.
+        ask_variables_on_launch: true
+        state: present
+
+    # --- CPU workflow nodes ---
+
+    - name: CPU WF — Create SNOW incident node
+      ansible.controller.workflow_job_template_node:
+        identifier: "cpu_node_snow"
+        workflow_job_template: "LM - CPU High Utilization Remediation"
+        unified_job_template: "LM - Create ServiceNow Incident"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    - name: CPU WF — Create approval node
+      ansible.controller.workflow_job_template_node:
+        identifier: "cpu_node_approval"
+        workflow_job_template: "LM - CPU High Utilization Remediation"
+        approval_node:
+          name: "Approve Web Server Restart"
+          description: >-
+            LogicMonitor detected critical CPU utilization — the web server
+            appears unresponsive. Review the ServiceNow incident and approve
+            to restart the httpd/apache2/IIS service on the affected host.
+          timeout: "{{ approval_timeout }}"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    - name: CPU WF — Create remediation node
+      ansible.controller.workflow_job_template_node:
+        identifier: "cpu_node_remediation"
+        workflow_job_template: "LM - CPU High Utilization Remediation"
+        unified_job_template: "LM - CPU High HTTPD Restart"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    # --- CPU workflow node links ---
+
+    - name: CPU WF — Link SNOW incident → approval (on success)
+      ansible.controller.workflow_job_template_node:
+        identifier: "cpu_node_snow"
+        workflow_job_template: "LM - CPU High Utilization Remediation"
+        success_nodes:
+          - "cpu_node_approval"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    - name: CPU WF — Link approval → remediation (on approve)
+      ansible.controller.workflow_job_template_node:
+        identifier: "cpu_node_approval"
+        workflow_job_template: "LM - CPU High Utilization Remediation"
+        success_nodes:
+          - "cpu_node_remediation"
+        organization: "{{ aap_organization }}"
+        state: present
+
+  # =========================================================================
+  # BLOCK 6 — Workflow: Disk Space Remediation
+  # =========================================================================
+
+    - name: Create workflow template — LM Disk Space Remediation
+      ansible.controller.workflow_job_template:
+        name: "LM - Disk Space Remediation"
+        organization: "{{ aap_organization }}"
+        description: >-
+          End-to-end remediation for critical disk space utilization.
+          Opens SNOW incident → waits for approval → cleans disk → resolves SNOW.
+        ask_variables_on_launch: true
+        state: present
+
+    # --- Disk workflow nodes ---
+
+    - name: Disk WF — Create SNOW incident node
+      ansible.controller.workflow_job_template_node:
+        identifier: "disk_node_snow"
+        workflow_job_template: "LM - Disk Space Remediation"
+        unified_job_template: "LM - Create ServiceNow Incident"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    - name: Disk WF — Create approval node
+      ansible.controller.workflow_job_template_node:
+        identifier: "disk_node_approval"
+        workflow_job_template: "LM - Disk Space Remediation"
+        approval_node:
+          name: "Approve Disk Space Cleanup"
+          description: >-
+            LogicMonitor detected critical disk utilization.
+            Review the ServiceNow incident and approve to remove stale /tmp files,
+            old compressed log archives, and vacuum the systemd journal.
+            No application data or active logs will be deleted.
+          timeout: "{{ approval_timeout }}"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    - name: Disk WF — Create remediation node
+      ansible.controller.workflow_job_template_node:
+        identifier: "disk_node_remediation"
+        workflow_job_template: "LM - Disk Space Remediation"
+        unified_job_template: "LM - Disk Space Cleanup"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    # --- Disk workflow node links ---
+
+    - name: Disk WF — Link SNOW incident → approval (on success)
+      ansible.controller.workflow_job_template_node:
+        identifier: "disk_node_snow"
+        workflow_job_template: "LM - Disk Space Remediation"
+        success_nodes:
+          - "disk_node_approval"
+        organization: "{{ aap_organization }}"
+        state: present
+
+    - name: Disk WF — Link approval → remediation (on approve)
+      ansible.controller.workflow_job_template_node:
+        identifier: "disk_node_approval"
+        workflow_job_template: "LM - Disk Space Remediation"
+        success_nodes:
+          - "disk_node_remediation"
+        organization: "{{ aap_organization }}"
+        state: present
+
+  # =========================================================================
+  # BLOCK 7 — Summary
+  # =========================================================================
+
+    - name: Setup complete — print object summary
+      ansible.builtin.debug:
+        msg:
+          - "===== AAP Setup Complete ====="
+          - "Credential Type : ServiceNow"
+          - "Credential      : {{ snow_credential_name }}"
+          - "Inventory       : {{ localhost_inventory }}"
+          - ""
+          - "Job Templates:"
+          - "  - LM - Create ServiceNow Incident"
+          - "  - LM - Cisco Interface No-Shut"
+          - "  - LM - CPU High HTTPD Restart"
+          - "  - LM - Disk Space Cleanup"
+          - ""
+          - "Workflow Templates:"
+          - "  - LM - Cisco Interface Remediation"
+          - "  - LM - CPU High Utilization Remediation"
+          - "  - LM - Disk Space Remediation"
+          - ""
+          - "Next steps:"
+          - "  1. Create an EDA Rulebook Activation using rulebooks/lm_remediation.yml"
+          - "  2. Configure the EDA activation with your AAP Controller token credential"
+          - "  3. Configure LogicMonitor HTTP Integration to POST to http://<eda-host>:5000"
+          - "  4. Verify 'Network Devices' and 'Managed Servers' inventories contain hosts"
+          - "  5. Verify '{{ server_credential_name }}' credential exists for server access"
