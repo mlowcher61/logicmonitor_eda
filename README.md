@@ -33,17 +33,21 @@ AAP Workflow Template
 ```
 logicmonitor-eda-aap/
 ├── collections/
-│   └── requirements.yml          # Certified collection dependencies (Automation Hub)
+│   └── requirements.yml              # Certified collection dependencies (Automation Hub)
 ├── rulebooks/
-│   └── lm_remediation.yml        # EDA rulebook — single webhook listener, 3 rules
+│   └── lm_remediation.yml            # EDA rulebook — single webhook listener, 3 rules
 ├── playbooks/
-│   ├── snow_create_incident.yml  # Opens ServiceNow incident; publishes sys_id artifact
-│   ├── cisco_no_shut.yml         # Cisco IOS: no-shut Tunnel0/Tunnel1 + resolve SNOW
-│   ├── cpu_httpd_restart.yml     # Linux/Windows: restart httpd/IIS + resolve SNOW
-│   ├── disk_space_cleanup.yml    # Linux: clean /tmp, log archives, journal + resolve SNOW
-│   └── cisco_snmp_trap.yml       # One-time: configure SNMPv2c traps toward LogicMonitor
+│   ├── logicmonitor_configure.yml    # One-time: configure LM integrations, chains, and alert rules
+│   ├── snow_create_incident.yml      # Opens ServiceNow incident; publishes sys_id artifact
+│   ├── cisco_no_shut.yml             # Cisco IOS: no-shut Tunnel0/Tunnel1 + resolve SNOW
+│   ├── cpu_httpd_restart.yml         # Linux/Windows: restart httpd/IIS + resolve SNOW
+│   ├── disk_space_cleanup.yml        # Linux: clean /tmp, log archives, journal + resolve SNOW
+│   ├── cisco_snmp_trap.yml           # One-time: configure SNMPv2c traps toward LogicMonitor
+│   └── tasks/
+│       ├── lm_api_call.yml           # Reusable: LMv1 HMAC-SHA256 auth + API request helper
+│       └── lm_alert_rule.yml         # Reusable: idempotent LM alert rule create helper
 └── setup/
-    └── aap_setup.yml             # Provisions all required AAP objects (run once)
+    └── aap_setup.yml                 # Provisions all required AAP objects (run once)
 ```
 
 ---
@@ -129,9 +133,9 @@ token = <your_automation_hub_token>
 ### Step 2 — Run the AAP Setup Playbook
 
 The setup playbook provisions all AAP objects in a single run:
-- ServiceNow custom credential type and credential
+- ServiceNow and LogicMonitor custom credential types and credentials
 - Localhost inventory
-- 5 job templates
+- 6 job templates
 - 3 workflow templates with approval nodes
 
 **Set your AAP controller connection via environment variables:**
@@ -162,13 +166,83 @@ The playbook is idempotent — safe to re-run if you need to update or recreate 
 | `server_credential_name` | `linux_server_cred` | Machine credential for server SSH/WinRM |
 | `snow_credential_name` | `servicenow` | Name for the created ServiceNow credential |
 | `sn_host` | *(your instance URL)* | ServiceNow instance URL |
+| `lm_credential_name` | `logicmonitor` | Name for the created LogicMonitor credential |
+| `lm_company` | `ACME` | LogicMonitor account subdomain — **update before running** |
+| `lm_access_id` | *(placeholder)* | LogicMonitor API access ID — **update before running** |
+| `lm_access_key` | *(placeholder)* | LogicMonitor API access key — **update before running** |
 | `approval_timeout` | `3600` | Seconds before an approval node times out (0 = never) |
 
-> **Security note:** Move `sn_password` out of plaintext for production. Use an external vault or pass it at runtime: `ansible-playbook setup/aap_setup.yml -e @vault_file.yml`
+> **Security note:** Move `sn_password` and `lm_access_key` out of plaintext for production. Use an external vault or pass them at runtime: `ansible-playbook setup/aap_setup.yml -e @vault_file.yml`
 
 ---
 
-### Step 3 — Configure SNMP Traps on Cisco Devices (one-time)
+### Step 3 — Configure LogicMonitor via Playbook
+
+`logicmonitor_configure.yml` automates all LogicMonitor configuration through the LM REST API. It creates three objects from scratch:
+
+| Object | Name | Purpose |
+|---|---|---|
+| HTTP Integration | `EDA Auto-Remediation Webhook` | Delivers alert payloads via HTTP POST to the EDA listener on port 5000 |
+| Escalation Chain | `EDA Auto-Remediation Chain` | Routes matching alerts to the HTTP integration immediately (0-minute delay) |
+| Alert Rule × 3 | `EDA - Cisco Interface Down` / `EDA - CPU High Utilization` / `EDA - Disk Space Critical` | Filters alerts by datasource and datapoint and assigns the escalation chain |
+
+All three tasks are **idempotent** — re-running the playbook skips objects that already exist.
+
+#### Before running
+
+Update the `logicmonitor` credential in AAP with your real values. API tokens are created in LogicMonitor under **Settings → Users and Roles → API Tokens**.
+
+#### Run from AAP
+
+Launch the `LM - Configure LogicMonitor` job template. No extra variables are needed for a standard run.
+
+#### Run from the command line
+
+```bash
+export CONTROLLER_HOST=https://your-aap-controller.example.com
+ansible-playbook playbooks/logicmonitor_configure.yml
+```
+
+The `LM_COMPANY`, `LM_ACCESS_ID`, and `LM_ACCESS_KEY` environment variables must be present (injected automatically when run as an AAP job template with the `logicmonitor` credential attached).
+
+#### Verify your datasource names first (optional but recommended)
+
+LogicMonitor datasource names vary between LM versions and installed packages. Before creating alert rules, you can run the playbook in discovery mode to list every active datasource name in your LM instance:
+
+**From AAP:** Launch `LM - Configure LogicMonitor` with the extra variable:
+```
+lm_discover_only=true
+```
+
+**From the command line:**
+```bash
+ansible-playbook playbooks/logicmonitor_configure.yml -e "lm_discover_only=true"
+```
+
+The playbook will print a sorted list of all datasource names and exit without making any changes. Compare the output against the defaults used in the alert rules:
+
+| Alert Rule | Default Datasource | Default DataPoint |
+|---|---|---|
+| EDA - Cisco Interface Down | `Cisco_IOS_Interfaces` | `ifOperStatus` |
+| EDA - CPU High Utilization | `*` (any) | `CPUBusyPercent` |
+| EDA - Disk Space Critical | `Linux_Disk` | `Capacity` |
+
+If your LM instance uses different names, update the `alert_rules` var in `playbooks/logicmonitor_configure.yml` before running, or pass overrides as extra variables.
+
+#### How LM authentication works
+
+Every API call to LogicMonitor uses **LMv1 HMAC-SHA256** authentication. The reusable helper `playbooks/tasks/lm_api_call.yml` handles this automatically:
+
+1. Takes the HTTP method, resource path, and request body
+2. Computes `HMAC-SHA256(AccessKey, method + epoch_ms + body + /santaba/rest<path>)`
+3. Base64-encodes the signature and builds the `Authorization: LMv1 <id>:<sig>:<epoch>` header
+4. Executes the `uri` call and returns the result in `lm_response`
+
+The access key is never written to disk — it stays in the environment variable injected by the `logicmonitor` credential.
+
+---
+
+### Step 4 — Configure SNMP Traps on Cisco Devices (one-time)
 
 Run the `LM - Cisco SNMP Trap Configuration` job template from AAP, or directly:
 
@@ -184,7 +258,7 @@ This configures on all hosts in the `cisco` inventory group:
 
 ---
 
-### Step 4 — Create the EDA Rulebook Activation
+### Step 5 — Create the EDA Rulebook Activation
 
 In the EDA Controller UI:
 
@@ -195,36 +269,6 @@ In the EDA Controller UI:
 5. Save and enable the activation
 
 The activation listens on **port 5000** for incoming HTTP POST webhooks.
-
----
-
-### Step 5 — Configure LogicMonitor HTTP Integration
-
-In LogicMonitor, create an **HTTP Integration** (Integrations → Add → HTTP Delivery):
-
-- **URL:** `http://<eda-host>:5000`
-- **Method:** POST
-- **Content-Type:** `application/json`
-- **Body template:**
-
-```json
-{
-  "alertId":     "##ALERTID##",
-  "alertStatus": "##ALERTSTATUS##",
-  "severity":    "##LEVEL##",
-  "host":        "##HOST##",
-  "dataSource":  "##DATASOURCE##",
-  "dataPoint":   "##DATAPOINT##",
-  "instance":    "##INSTANCE##",
-  "value":       "##VALUE##",
-  "message":     "##MESSAGE##",
-  "startEpoch":  "##STARTEPOCH##",
-  "threshold":   "##THRESHOLD##",
-  "deviceGroup": "##DEVICEGROUP##"
-}
-```
-
-Attach this integration to the relevant alert rules in LogicMonitor for the datasources you want to monitor.
 
 ---
 
@@ -239,6 +283,22 @@ The setup playbook creates a **custom credential type** named `ServiceNow` in AA
 | `SN_PASSWORD` | ServiceNow password |
 
 These variables are consumed by the `servicenow.itsm.incident` module in all playbooks. No credential values are hardcoded in the playbooks themselves.
+
+---
+
+## LogicMonitor Credential
+
+The setup playbook creates a **custom credential type** named `LogicMonitor` in AAP. It injects the following environment variables into any job template that uses it:
+
+| Environment Variable | Description |
+|---|---|
+| `LM_COMPANY` | LogicMonitor account subdomain (e.g. `acme` for `acme.logicmonitor.com`) |
+| `LM_ACCESS_ID` | LogicMonitor API access ID |
+| `LM_ACCESS_KEY` | LogicMonitor API access key (secret) |
+
+These are consumed by `playbooks/logicmonitor_configure.yml` and `playbooks/cisco_snmp_trap.yml`. The access key is used exclusively inside the `lm_api_call.yml` helper to compute HMAC signatures in memory — it is never written to disk or logged.
+
+To create API tokens in LogicMonitor: **Settings → Users and Roles → API Tokens → Add**.
 
 ---
 
