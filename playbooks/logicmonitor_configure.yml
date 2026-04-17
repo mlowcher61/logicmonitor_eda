@@ -1,0 +1,255 @@
+---
+# logicmonitor_configure.yml — Configure LogicMonitor to Send Alerts to EDA
+#
+# Creates the following objects in LogicMonitor from scratch:
+#   1. HTTP Integration  — webhook that POSTs alerts to the EDA listener
+#   2. Escalation Chain  — routes alerts immediately to the HTTP integration
+#   3. Alert Rules (3)   — one rule per EDA remediation use case:
+#        - Cisco protected interface down   (datapoint: ifOperStatus)
+#        - CPU high utilization             (datapoint: CPUBusyPercent)
+#        - Disk space critical              (datapoint: Capacity)
+#
+# IMPORTANT — Datasource names:
+#   LogicMonitor datasource names vary by LM version and installed packages.
+#   The names below are common defaults. If your instance uses different names,
+#   update the 'datasource' field in the alert_rules var, or set it to "*" to
+#   match all datasources and rely solely on the datapoint name to filter.
+#   Run with the -e "lm_discover_only=true" flag to list your active
+#   datasources without making any changes.
+#
+# Required custom credential (type: LogicMonitor) must be attached to this
+# job template. It injects:
+#   LM_COMPANY    — LogicMonitor account subdomain
+#   LM_ACCESS_ID  — API access ID
+#   LM_ACCESS_KEY — API access key
+#
+# EDA webhook URL is set in vars below and can be overridden as an extra var.
+
+- name: Configure LogicMonitor for EDA Auto-Remediation
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # -------------------------------------------------------------------------
+    # LogicMonitor credentials are injected by the custom credential type as
+    # environment variables: LM_COMPANY, LM_ACCESS_ID, LM_ACCESS_KEY
+    # -------------------------------------------------------------------------
+    lm_company:    "{{ lookup('env', 'LM_COMPANY') }}"
+    lm_access_id:  "{{ lookup('env', 'LM_ACCESS_ID') }}"
+
+    # -------------------------------------------------------------------------
+    # EDA webhook endpoint — port 5000 matches lm_remediation.yml rulebook
+    # -------------------------------------------------------------------------
+    eda_webhook_url: "https://aap-aap.apps.cluster-w7h8f-1.dynamic.redhatworkshops.io:5000"
+
+    # -------------------------------------------------------------------------
+    # LogicMonitor object names created by this playbook
+    # -------------------------------------------------------------------------
+    lm_integration_name: "EDA Auto-Remediation Webhook"
+    lm_chain_name:        "EDA Auto-Remediation Chain"
+
+    # -------------------------------------------------------------------------
+    # Webhook payload — field names must match the EDA rulebook conditions
+    # in rulebooks/lm_remediation.yml exactly.
+    # -------------------------------------------------------------------------
+    lm_webhook_payload: >-
+      {"alertId":"##ALERTID##","alertStatus":"##ALERTSTATUS##","severity":"##LEVEL##",
+      "host":"##HOST##","dataSource":"##DATASOURCE##","dataPoint":"##DATAPOINT##",
+      "instance":"##INSTANCE##","value":"##VALUE##","message":"##MESSAGE##",
+      "startEpoch":"##STARTEPOCH##","threshold":"##THRESHOLD##","deviceGroup":"##DEVICEGROUP##"}
+
+    # -------------------------------------------------------------------------
+    # Alert rules — one per EDA rulebook condition.
+    # datasource: Use "*" to match all datasources if exact name is unknown.
+    # levelStr:   All | Warn | Error | Critical
+    # priority:   Lower numbers = higher priority. Rules are evaluated in order.
+    #
+    # NOTE: Verify datasource names match your LM instance exactly.
+    #   Common LM datasource names:
+    #     Cisco interfaces : Cisco_IOS_Interfaces  (may also be SNMP_Network_Interfaces)
+    #     Linux CPU        : Linux_CPU             (may also be Host_CPU)
+    #     Windows CPU      : WinCPU
+    #     Linux disk       : Linux_Disk            (may also be Host_Disk)
+    # -------------------------------------------------------------------------
+    alert_rules:
+      - name: "EDA - Cisco Interface Down"
+        datasource: "Cisco_IOS_Interfaces"
+        datapoint:  "ifOperStatus"
+        instance:   "Tunnel*"
+        levelStr:   "Error"
+        priority:   100
+
+      - name: "EDA - CPU High Utilization"
+        datasource: "*"
+        datapoint:  "CPUBusyPercent"
+        instance:   "*"
+        levelStr:   "Critical"
+        priority:   200
+
+      - name: "EDA - Disk Space Critical"
+        datasource: "Linux_Disk"
+        datapoint:  "Capacity"
+        instance:   "*"
+        levelStr:   "Error"
+        priority:   300
+
+  pre_tasks:
+
+    - name: Validate required environment variables are present
+      ansible.builtin.assert:
+        that:
+          - lm_company | length > 0
+          - lm_access_id | length > 0
+          - lookup('env', 'LM_ACCESS_KEY') | length > 0
+        fail_msg: >-
+          LogicMonitor credential environment variables are missing.
+          Ensure the 'logicmonitor' custom credential is attached to this job template.
+
+    # -------------------------------------------------------------------------
+    # Optional discovery mode — lists active datasources then exits.
+    # Launch with extra var:  -e "lm_discover_only=true"
+    # -------------------------------------------------------------------------
+    - name: Discover active datasources (discovery mode only)
+      when: lm_discover_only | default(false) | bool
+      block:
+        - name: Fetch all datasources from LogicMonitor
+          ansible.builtin.include_tasks: tasks/lm_api_call.yml
+          vars:
+            lm_method: "GET"
+            lm_path:   "/setting/datasources"
+            lm_query:  "?size=1000&fields=name,displayedAs,appliesTo"
+
+        - name: Print datasource names
+          ansible.builtin.debug:
+            msg: "{{ lm_response.json.items | map(attribute='name') | sort | list }}"
+
+        - name: End play — discovery mode complete
+          ansible.builtin.meta: end_play
+
+  tasks:
+
+    # =========================================================================
+    # STEP 1 — HTTP Integration (webhook to EDA)
+    # =========================================================================
+
+    - name: Check if HTTP integration already exists
+      ansible.builtin.include_tasks: tasks/lm_api_call.yml
+      vars:
+        lm_method: "GET"
+        lm_path:   "/setting/integrations"
+        lm_query:  "?filter=name:{{ lm_integration_name | urlencode }}&fields=id,name,type"
+
+    - name: Set existing integration ID (if found)
+      ansible.builtin.set_fact:
+        lm_integration_id: "{{ lm_response.json.items[0].id | default(omit) }}"
+        lm_integration_exists: "{{ (lm_response.json.items | length) > 0 }}"
+
+    - name: Create HTTP integration → EDA webhook
+      when: not lm_integration_exists
+      ansible.builtin.include_tasks: tasks/lm_api_call.yml
+      vars:
+        lm_method: "POST"
+        lm_path:   "/setting/integrations"
+        lm_body:
+          name:             "{{ lm_integration_name }}"
+          type:             "HttpDelivery"
+          # NOTE: If LM returns a 400 on 'type', check your LM version. Some
+          # older versions use "http" instead of "HttpDelivery".
+          deliveryUrl:      "{{ eda_webhook_url }}"
+          method:           "post"
+          contentType:      "application/json"
+          body:             "{{ lm_webhook_payload }}"
+          additionalHeaders: ""
+
+    - name: Capture new integration ID
+      when: not lm_integration_exists
+      ansible.builtin.set_fact:
+        lm_integration_id: "{{ lm_response.json.id }}"
+
+    - name: Print integration result
+      ansible.builtin.debug:
+        msg: >-
+          HTTP Integration '{{ lm_integration_name }}':
+          {{ 'already existed' if lm_integration_exists else 'created' }}
+          (ID: {{ lm_integration_id }})
+
+    # =========================================================================
+    # STEP 2 — Escalation Chain
+    # =========================================================================
+
+    - name: Check if escalation chain already exists
+      ansible.builtin.include_tasks: tasks/lm_api_call.yml
+      vars:
+        lm_method: "GET"
+        lm_path:   "/setting/alert/chains"
+        lm_query:  "?filter=name:{{ lm_chain_name | urlencode }}&fields=id,name"
+
+    - name: Set existing escalation chain ID (if found)
+      ansible.builtin.set_fact:
+        lm_chain_id:     "{{ lm_response.json.items[0].id | default(omit) }}"
+        lm_chain_exists: "{{ (lm_response.json.items | length) > 0 }}"
+
+    - name: Create escalation chain → routes to EDA HTTP integration
+      when: not lm_chain_exists
+      ansible.builtin.include_tasks: tasks/lm_api_call.yml
+      vars:
+        lm_method: "POST"
+        lm_path:   "/setting/alert/chains"
+        lm_body:
+          name:        "{{ lm_chain_name }}"
+          description: "Routes LogicMonitor alerts immediately to EDA auto-remediation webhook"
+          stages:
+            - executeEvery: 0
+              where:
+                type: "all"
+              recipients:
+                - type:     "integration"
+                  methodId: "{{ lm_integration_id | int }}"
+                  method:   "{{ lm_integration_name }}"
+
+    - name: Capture new escalation chain ID
+      when: not lm_chain_exists
+      ansible.builtin.set_fact:
+        lm_chain_id: "{{ lm_response.json.id }}"
+
+    - name: Print escalation chain result
+      ansible.builtin.debug:
+        msg: >-
+          Escalation Chain '{{ lm_chain_name }}':
+          {{ 'already existed' if lm_chain_exists else 'created' }}
+          (ID: {{ lm_chain_id }})
+
+    # =========================================================================
+    # STEP 3 — Alert Rules (loop over alert_rules var)
+    # =========================================================================
+
+    - name: Process alert rules
+      ansible.builtin.include_tasks: tasks/lm_alert_rule.yml
+      loop: "{{ alert_rules }}"
+      loop_control:
+        loop_var: rule
+        label: "{{ rule.name }}"
+
+    # =========================================================================
+    # STEP 4 — Summary
+    # =========================================================================
+
+    - name: Print configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "===== LogicMonitor EDA Configuration Complete ====="
+          - "LM Account        : {{ lm_company }}.logicmonitor.com"
+          - "HTTP Integration  : {{ lm_integration_name }} (ID: {{ lm_integration_id }})"
+          - "Escalation Chain  : {{ lm_chain_name }} (ID: {{ lm_chain_id }})"
+          - "EDA Webhook URL   : {{ eda_webhook_url }}"
+          - ""
+          - "Alert Rules configured:"
+          - "  1. EDA - Cisco Interface Down   (ifOperStatus on Tunnel* — Error+)"
+          - "  2. EDA - CPU High Utilization   (CPUBusyPercent — Critical)"
+          - "  3. EDA - Disk Space Critical     (Capacity — Error+)"
+          - ""
+          - "Next steps:"
+          - "  1. Verify datasource names in LM match the alert rules above."
+          - "     Re-run with -e 'lm_discover_only=true' to list your LM datasources."
+          - "  2. Confirm EDA port 5000 is reachable from the LogicMonitor collector."
+          - "  3. Trigger a test alert in LM and verify EDA receives the webhook."

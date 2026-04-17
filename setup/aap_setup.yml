@@ -46,6 +46,7 @@
     snow_credential_name: "servicenow"
     cisco_credential_name: "net_cred"
     server_credential_name: "linux_server_cred"   # Update to match your credential
+    lm_credential_name: "logicmonitor"
 
     # ServiceNow connection details — stored in the custom credential
     # WARNING: Move sn_password out of plaintext before running in production.
@@ -54,11 +55,18 @@
     sn_username: "mlowcher"
     sn_password: "R3dh@t123!"
 
+    # LogicMonitor connection details — stored in the custom credential
+    # Replace these placeholder values with your real LogicMonitor API credentials.
+    # Access ID and Key are created under LM Settings → Users and Roles → API Tokens.
+    lm_company:     "ACME"
+    lm_access_id:   "84729301"
+    lm_access_key:  "xK7mP2nQ9rT4vY8wZ1aB3cD5eF6gH0iJ"
+
     # Workflow approval timeout in seconds (3600 = 1 hour)
     approval_timeout: 3600
 
   # =========================================================================
-  # BLOCK 1 — ServiceNow Custom Credential Type
+  # BLOCK 1 — Custom Credential Types and Credentials
   # =========================================================================
   tasks:
 
@@ -103,6 +111,51 @@
           sn_host: "{{ sn_host }}"
           sn_username: "{{ sn_username }}"
           sn_password: "{{ sn_password }}"
+        state: present
+
+    - name: Create LogicMonitor custom credential type
+      ansible.controller.credential_type:
+        name: "LogicMonitor"
+        kind: cloud
+        description: >-
+          LogicMonitor API credential. Injects LM_COMPANY, LM_ACCESS_ID,
+          and LM_ACCESS_KEY as environment variables.
+        inputs:
+          fields:
+            - id: lm_company
+              type: string
+              label: "LogicMonitor Account Subdomain"
+              help_text: "Your account subdomain (e.g. 'acme' for acme.logicmonitor.com)"
+            - id: lm_access_id
+              type: string
+              label: "API Access ID"
+              help_text: "Found under LM Settings → Users and Roles → API Tokens"
+            - id: lm_access_key
+              type: string
+              label: "API Access Key"
+              secret: true
+              help_text: "Secret key paired with the Access ID"
+          required:
+            - lm_company
+            - lm_access_id
+            - lm_access_key
+        injectors:
+          env:
+            LM_COMPANY:     !unsafe "{{ lm_company }}"
+            LM_ACCESS_ID:   !unsafe "{{ lm_access_id }}"
+            LM_ACCESS_KEY:  !unsafe "{{ lm_access_key }}"
+        state: present
+
+    - name: Create LogicMonitor credential
+      ansible.controller.credential:
+        name: "{{ lm_credential_name }}"
+        organization: "{{ aap_organization }}"
+        credential_type: "LogicMonitor"
+        description: "LogicMonitor API credentials — update Access ID and Key before use"
+        inputs:
+          lm_company:    "{{ lm_company }}"
+          lm_access_id:  "{{ lm_access_id }}"
+          lm_access_key: "{{ lm_access_key }}"
         state: present
 
   # =========================================================================
@@ -192,6 +245,23 @@
           Resolves the ServiceNow incident if disk drops below 80% after cleanup.
         ask_variables_on_launch: true
         become_enabled: true
+        state: present
+
+    - name: Create job template — LM Configure LogicMonitor
+      ansible.controller.job_template:
+        name: "LM - Configure LogicMonitor"
+        organization: "{{ aap_organization }}"
+        project: "{{ aap_project_name }}"
+        playbook: "playbooks/logicmonitor_configure.yml"
+        inventory: "{{ localhost_inventory }}"
+        credentials:
+          - "{{ lm_credential_name }}"
+        description: >-
+          Creates the EDA webhook HTTP integration, escalation chain, and three
+          alert rules in LogicMonitor. Run once to wire LM → EDA alerting.
+          Re-run safely — all tasks are idempotent.
+          Launch with extra var lm_discover_only=true to list datasource names only.
+        ask_variables_on_launch: true
         state: present
 
   # =========================================================================
@@ -434,9 +504,10 @@
       ansible.builtin.debug:
         msg:
           - "===== AAP Setup Complete ====="
-          - "Credential Type : ServiceNow"
-          - "Credential      : {{ snow_credential_name }}"
-          - "Inventory       : {{ localhost_inventory }}"
+          - ""
+          - "Credential Types : ServiceNow, LogicMonitor"
+          - "Credentials      : {{ snow_credential_name }}, {{ lm_credential_name }}"
+          - "Inventory        : {{ localhost_inventory }}"
           - ""
           - "Job Templates:"
           - "  - LM - Create ServiceNow Incident"
@@ -444,6 +515,7 @@
           - "  - LM - CPU High HTTPD Restart"
           - "  - LM - Disk Space Cleanup"
           - "  - LM - Cisco SNMP Trap Configuration"
+          - "  - LM - Configure LogicMonitor"
           - ""
           - "Workflow Templates:"
           - "  - LM - Cisco Interface Remediation"
@@ -451,9 +523,10 @@
           - "  - LM - Disk Space Remediation"
           - ""
           - "Next steps:"
-          - "  1. Create an EDA Rulebook Activation using rulebooks/lm_remediation.yml"
-          - "  2. Configure the EDA activation with your AAP Controller token credential"
-          - "  3. Configure LogicMonitor HTTP Integration to POST to http://<eda-host>:5000"
-          - "  4. Verify 'Network Devices' and 'Managed Servers' inventories contain hosts"
-          - "  5. Verify '{{ server_credential_name }}' credential exists for server access"
-          - "  6. Run 'LM - Cisco SNMP Trap Configuration' with logicmonitor_ip survey answer"
+          - "  1. Update 'logicmonitor' credential with real LM Access ID and Key"
+          - "  2. Run 'LM - Configure LogicMonitor' to wire LM → EDA alerting"
+          - "  3. Run 'LM - Cisco SNMP Trap Configuration' with logicmonitor_ip survey answer"
+          - "  4. Create an EDA Rulebook Activation using rulebooks/lm_remediation.yml"
+          - "  5. Configure the EDA activation with your AAP Controller token credential"
+          - "  6. Verify 'Network Devices' and 'Managed Servers' inventories contain hosts"
+          - "  7. Verify '{{ server_credential_name }}' credential exists for server access"

@@ -1,0 +1,69 @@
+---
+# Reusable task file: LMv1 Authenticated API Call
+#
+# Generates an LMv1 HMAC-SHA256 auth header and executes one LogicMonitor
+# REST API request. Import with ansible.builtin.include_tasks.
+#
+# Required variables (set before including this file):
+#   lm_method     — HTTP method: GET | POST | PUT | PATCH | DELETE
+#   lm_path       — API resource path (e.g. /setting/integrations)
+#                   Do NOT include /santaba/rest prefix — added automatically.
+#   lm_body       — Request body dict (omit or set {} for GET/DELETE calls)
+#
+# Environment variables (injected by the LogicMonitor custom credential):
+#   LM_COMPANY    — LogicMonitor account subdomain
+#   LM_ACCESS_ID  — LogicMonitor API access ID
+#   LM_ACCESS_KEY — LogicMonitor API access key (secret)
+#
+# Result variable set after include:
+#   lm_response   — ansible.builtin.uri module result
+
+- name: "LM API | Serialize request body for {{ lm_method }} {{ lm_path }}"
+  ansible.builtin.set_fact:
+    _lm_body_str: "{{ lm_body | default({}) | to_json(sort_keys=True) if (lm_body | default({})) else '' }}"
+
+- name: "LM API | Generate LMv1 HMAC-SHA256 signature for {{ lm_method }} {{ lm_path }}"
+  ansible.builtin.shell: |
+    python3 << 'PYEOF'
+    import hmac, hashlib, base64, time, os, sys
+
+    epoch  = str(int(time.time() * 1000))
+    method = os.environ['LM_METHOD'].upper()
+    body   = os.environ.get('LM_BODY', '')
+    # Signature uses /santaba/rest prefix + resource path
+    path   = '/santaba/rest' + os.environ['LM_PATH']
+    ak     = os.environ['LM_ACCESS_KEY']
+
+    msg    = method + epoch + body + path
+    sig    = base64.b64encode(
+                 hmac.new(ak.encode(), msg.encode(), digestmod=hashlib.sha256).digest()
+             ).decode()
+    # Output format:  epoch|signature
+    print(f"{epoch}|{sig}")
+    PYEOF
+  environment:
+    LM_METHOD: "{{ lm_method }}"
+    LM_PATH:   "{{ lm_path }}"
+    LM_BODY:   "{{ _lm_body_str }}"
+    # LM_ACCESS_KEY is already in environment from the custom credential injector
+  register: _lm_auth
+  changed_when: false
+  no_log: true
+
+- name: "LM API | {{ lm_method }} {{ lm_path }}"
+  ansible.builtin.uri:
+    url: >-
+      https://{{ lookup('env', 'LM_COMPANY') }}.logicmonitor.com/santaba/rest{{ lm_path }}{{ lm_query | default('') }}
+    method: "{{ lm_method }}"
+    headers:
+      Authorization: >-
+        LMv1 {{ lookup('env', 'LM_ACCESS_ID') }}:{{ _lm_auth.stdout.split('|')[1] }}:{{ _lm_auth.stdout.split('|')[0] }}
+      Content-Type: "application/json"
+      X-Version: "3"
+    body: "{{ _lm_body_str if _lm_body_str != '' else omit }}"
+    body_format: json
+    status_code: "{{ lm_expected_status | default([200, 201]) }}"
+    validate_certs: true
+    return_content: true
+  register: lm_response
+  no_log: false

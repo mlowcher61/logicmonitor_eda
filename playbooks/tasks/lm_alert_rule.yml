@@ -1,0 +1,47 @@
+---
+# Reusable task file: Create a single LogicMonitor Alert Rule (idempotent)
+#
+# Called in a loop from logicmonitor_configure.yml.
+# Loop variable: rule (dict with name, datasource, datapoint, instance,
+#                      levelStr, priority)
+# Required vars in scope: lm_chain_id
+
+- name: "Alert Rule | Check if '{{ rule.name }}' already exists"
+  ansible.builtin.include_tasks: lm_api_call.yml
+  vars:
+    lm_method: "GET"
+    lm_path:   "/setting/alert/rules"
+    lm_query:  "?filter=name:{{ rule.name | urlencode }}&fields=id,name"
+
+- name: "Alert Rule | Set existing rule state for '{{ rule.name }}'"
+  ansible.builtin.set_fact:
+    _rule_id:     "{{ lm_response.json.items[0].id | default(omit) }}"
+    _rule_exists: "{{ (lm_response.json.items | length) > 0 }}"
+
+- name: "Alert Rule | Create '{{ rule.name }}'"
+  when: not _rule_exists
+  ansible.builtin.include_tasks: lm_api_call.yml
+  vars:
+    lm_method: "POST"
+    lm_path:   "/setting/alert/rules"
+    lm_body:
+      name:                    "{{ rule.name }}"
+      priority:                "{{ rule.priority | int }}"
+      levelStr:                "{{ rule.levelStr }}"
+      datasource:              "{{ rule.datasource }}"
+      datapoint:               "{{ rule.datapoint }}"
+      instance:                "{{ rule.instance | default('*') }}"
+      devices:
+        - "*"
+      deviceGroups:
+        - "*"
+      escalationChainId:       "{{ lm_chain_id | int }}"
+      escalatingChainInterval: 0
+      sendClearedAlert:        false
+      suppressAlertAckSdt:     false
+
+- name: "Alert Rule | '{{ rule.name }}' result"
+  ansible.builtin.debug:
+    msg: >-
+      Alert Rule '{{ rule.name }}':
+      {{ 'already existed (skipped)' if _rule_exists else 'created (ID: ' + lm_response.json.id | string + ')' }}
